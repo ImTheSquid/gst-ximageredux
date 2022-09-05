@@ -1,13 +1,13 @@
 use std::{sync::{Mutex, atomic::AtomicBool, Arc, MutexGuard}, time::Duration, ffi::CStr};
 
 use derivative::Derivative;
-use gst::{glib::{self, error}, subclass::prelude::{ObjectSubclass, ElementImpl, ObjectImpl, GstObjectImpl, ObjectImplExt}, prelude::ToValue, Memory, error_msg, FlowError};
-use gst_app::prelude::{BaseSinkExt, BaseSrcExt};
+use gst::{glib::{self, ffi::{G_LITTLE_ENDIAN, G_BIG_ENDIAN}}, subclass::prelude::{ObjectSubclass, ElementImpl, ObjectImpl, GstObjectImpl, ObjectImplExt, ElementImplExt}, prelude::{ToValue, ElementExtManual}, FlowError, error_msg};
+use gst_app::prelude::BaseSrcExt;
 use gst_base::{BaseSrc, subclass::{prelude::BaseSrcImpl, base_src::CreateSuccess}};
 use gst_video::ffi::{gst_video_format_from_masks, gst_video_format_to_string};
 use once_cell::sync::Lazy;
 use anyhow::{Result, bail};
-use xcb::x::{GetGeometry, Drawable, GetImage, self};
+use xcb::{x::{GetGeometry, Drawable, GetImage, self, ImageOrder}, CookieWithReplyChecked, Connection};
 
 use gst::gst_error as error;
 
@@ -25,6 +25,7 @@ type Xid = u32;
 #[derivative(Default)]
 struct State {
     connection: Option<xcb::Connection>,
+    screen_num: Option<i32>,
     xid: Option<Xid>,
     #[derivative(Default(value="true"))]
     needs_size_update: bool,
@@ -38,6 +39,7 @@ pub struct XImageRedux {
     state: Mutex<State>
 }
 
+#[derive(Debug)]
 struct Size {
     width: u16,
     height: u16
@@ -47,7 +49,7 @@ impl XImageRedux {
     fn get_frame(&self) -> Result<gst::Buffer> {
         self.update_size_if_needed()?;
 
-        let mut state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         let (conn, xid) = get_connection(&state)?;
 
         let cookie = conn.send_request(&GetImage {
@@ -60,18 +62,27 @@ impl XImageRedux {
             plane_mask: u32::MAX,
         });
 
-        let reply = match conn.wait_for_reply(cookie) {
-            Ok(reply) => reply,
-            Err(e) => bail!("Failed to wait for X reply: {}", e)
-        };
+        let reply = wait_for_reply(conn, cookie)?;
 
         Ok(gst::Buffer::from_slice(reply.data().to_owned()))
     }
 
+    // Function looks weird to get around mutex issues
     fn update_size_if_needed(&self) -> Result<()> {
-        if self.state.lock().unwrap().needs_size_update || self.state.lock().unwrap().size.is_none() {
-            let _ = self.state.lock().unwrap().size.insert(self.get_size()?);
-            self.state.lock().unwrap().needs_size_update = false;
+        let should_update = {
+            let mut state = self.state.lock().unwrap();
+
+            if state.needs_size_update || state.size.is_none() {
+                state.needs_size_update = false;
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_update {
+            let new = self.get_size()?;
+            let _ = self.state.lock().unwrap().size.insert(new);
         }
 
         Ok(())
@@ -82,13 +93,10 @@ impl XImageRedux {
         let (conn, xid) = get_connection(&state)?;
         
         let cookie = conn.send_request(&GetGeometry {
-            drawable: Drawable::Window(unsafe { xcb::XidNew::new(xid) }),
+            drawable: Drawable::Window(unsafe { xcb::XidNew::new(xid) })
         });
 
-        let reply = match conn.wait_for_reply(cookie) {
-            Ok(reply) => reply,
-            Err(e) => bail!("Failed to wait for X reply: {}", e)
-        };
+        let reply = wait_for_reply(conn, cookie)?;
 
         Ok(Size {
             width: reply.width(),
@@ -96,9 +104,78 @@ impl XImageRedux {
         })
     }
 
-    unsafe fn get_video_format(&self) -> Result<i32> {
-        Ok(gst_video_format_from_masks(depth, bpp, endianness, red_mask, green_mask, blue_mask, alpha_mask))
+    fn open_connection(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+
+        let (connection, screen_num) = match xcb::Connection::connect(None) {
+            Ok((c, s)) => (c, s),
+            Err(e) => bail!("Failed to connect to X11 server: {}", e.to_string())
+        };
+
+        let _ = state.connection.insert(connection);
+        let _ = state.screen_num.insert(screen_num);
+
+        Ok(())
     }
+
+    unsafe fn get_video_format(&self) -> Result<i32> {
+        let state = self.state.lock().unwrap();
+        let (conn, xid) = get_connection(&state)?;
+
+        let setup = conn.get_setup();
+        let mut endianness = match setup.bitmap_format_bit_order() {
+            ImageOrder::MsbFirst => G_BIG_ENDIAN,
+            ImageOrder::LsbFirst => G_LITTLE_ENDIAN
+        };
+
+        let cookie = conn.send_request(&GetGeometry {
+            drawable: Drawable::Window(xcb::XidNew::new(xid))
+        });
+
+        let geometry_reply = wait_for_reply(conn, cookie)?;
+
+        let bpp = setup.pixmap_formats().iter().find(|fmt| fmt.depth() == geometry_reply.depth()).unwrap().bits_per_pixel();
+
+        let screen = setup.roots().nth(state.screen_num.unwrap() as usize).unwrap();
+
+        let visual = screen.allowed_depths()
+            .flat_map(|depth| depth.visuals().into_iter())
+            .find(|vis| vis.visual_id() == screen.root_visual())
+            .unwrap();
+
+        // Our caps system handles 24/32bpp RGB as big-endian
+        let (red_mask, green_mask, blue_mask) = if (bpp == 24 || bpp == 32) && endianness == G_LITTLE_ENDIAN {
+            endianness = G_BIG_ENDIAN;
+            let mut set = (visual.red_mask().to_be(), visual.green_mask().to_be(), visual.blue_mask().to_be());
+
+            if bpp == 24 {
+                set.0 >>= 8;
+                set.1 >>= 8;
+                set.2 >>= 8;
+            }
+
+            set
+        } else {
+            (visual.red_mask(), visual.green_mask(), visual.blue_mask())
+        };
+
+        let alpha_mask = if bpp == 32 {
+            !(red_mask | green_mask | blue_mask)
+        } else {
+            0
+        };
+
+        Ok(gst_video_format_from_masks(geometry_reply.depth().into(), bpp.into(), endianness, red_mask, green_mask, blue_mask, alpha_mask))
+    }
+}
+
+fn wait_for_reply<C>(conn: &Connection, cookie: C) -> Result<C::Reply> 
+    where C: CookieWithReplyChecked 
+    {
+        match conn.wait_for_reply(cookie) {
+            Ok(reply) => Ok(reply),
+            Err(e) => bail!("Failed to wait for X reply: {}", e)
+        }
 }
 
 fn get_connection<'a>(state: &'a MutexGuard<State>) -> Result<(&'a xcb::Connection, Xid)> {
@@ -123,19 +200,14 @@ impl BaseSrcImpl for XImageRedux {
     }
 
     fn start(&self, _element: &Self::Type) -> Result<(), gst::ErrorMessage> {
-        let mut state = self.state.lock().unwrap();
-
-        let connection = match xcb::Connection::connect(None) {
-            Ok((c, _)) => c,
-            Err(e) => return Err(gst::error_msg!(
+        if let Err(e) = self.open_connection() {
+            Err(error_msg!(
                 gst::ResourceError::Failed,
-                [&format!("Failed to connect to X11 server: {}", e.to_string())]
+                [&e.to_string()]
             ))
-        };
-
-        let _ = state.connection.insert(connection);
-
-        Ok(())
+        } else {
+            Ok(())
+        }
     }
 
     fn stop(&self, _element: &Self::Type) -> Result<(), gst::ErrorMessage> {
@@ -175,19 +247,18 @@ impl BaseSrcImpl for XImageRedux {
         Ok(CreateSuccess::NewBuffer(frame))
     }
 
-    // fn set_caps(&self, element: &Self::Type, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
-    //     println!("CAPS: {:#?}", caps);
-    //     Ok(())
-    // }
+    fn caps(&self, element: &Self::Type, _filter: Option<&gst::Caps>) -> Option<gst::Caps> {
+        if self.state.lock().unwrap().connection.is_none() {
+            if let Err(e) = self.open_connection() {
+                error!(CAT, "Failed to open connection: {}", e);
+                return Some(element.pad_template_list()[0].caps())
+            }
+        }
 
-    fn caps(&self, element: &Self::Type, filter: Option<&gst::Caps>) -> Option<gst::Caps> {
         if let Err(e) = self.update_size_if_needed() {
             error!(CAT, "Failed to update size: {}", e.to_string());
             return None;
         }
-
-        let state = self.state.lock().unwrap();
-        let size = state.size.as_ref().unwrap();
 
         let fmt = match unsafe { self.get_video_format() } {
             Ok(fmt) => fmt,
@@ -199,10 +270,14 @@ impl BaseSrcImpl for XImageRedux {
 
         let c_str: &CStr = unsafe { CStr::from_ptr(gst_video_format_to_string(fmt)) };
 
+        let state = self.state.lock().unwrap();
+        let size = state.size.as_ref().unwrap();
+
         Some(gst::Caps::new_simple("video/x-raw", &[
             ("format", &c_str.to_str().unwrap()),
-            ("width", &(size.width as u32)),
-            ("height", &(size.height as u32))
+            ("width", &(size.width as i32)),
+            ("height", &(size.height as i32)),
+            ("framerate", &(gst::FractionRange::new(gst::Fraction::new(0, 1), gst::Fraction::new(i32::MAX, 1))))
         ]))
     }
 }
