@@ -1,9 +1,10 @@
-use std::{sync::{Mutex, atomic::AtomicBool, Arc, MutexGuard}, time::Duration};
+use std::{sync::{Mutex, atomic::AtomicBool, Arc, MutexGuard}, time::Duration, ffi::CStr};
 
 use derivative::Derivative;
 use gst::{glib::{self, error}, subclass::prelude::{ObjectSubclass, ElementImpl, ObjectImpl, GstObjectImpl, ObjectImplExt}, prelude::ToValue, Memory, error_msg, FlowError};
 use gst_app::prelude::{BaseSinkExt, BaseSrcExt};
 use gst_base::{BaseSrc, subclass::{prelude::BaseSrcImpl, base_src::CreateSuccess}};
+use gst_video::ffi::{gst_video_format_from_masks, gst_video_format_to_string};
 use once_cell::sync::Lazy;
 use anyhow::{Result, bail};
 use xcb::x::{GetGeometry, Drawable, GetImage, self};
@@ -44,7 +45,7 @@ struct Size {
 
 impl XImageRedux {
     fn get_frame(&self) -> Result<gst::Buffer> {
-        self.resize_if_needed()?;
+        self.update_size_if_needed()?;
 
         let mut state = self.state.lock().unwrap();
         let (conn, xid) = get_connection(&state)?;
@@ -67,7 +68,7 @@ impl XImageRedux {
         Ok(gst::Buffer::from_slice(reply.data().to_owned()))
     }
 
-    fn resize_if_needed(&self) -> Result<()> {
+    fn update_size_if_needed(&self) -> Result<()> {
         if self.state.lock().unwrap().needs_size_update || self.state.lock().unwrap().size.is_none() {
             let _ = self.state.lock().unwrap().size.insert(self.get_size()?);
             self.state.lock().unwrap().needs_size_update = false;
@@ -93,6 +94,10 @@ impl XImageRedux {
             width: reply.width(),
             height: reply.height()
         })
+    }
+
+    unsafe fn get_video_format(&self) -> Result<i32> {
+        Ok(gst_video_format_from_masks(depth, bpp, endianness, red_mask, green_mask, blue_mask, alpha_mask))
     }
 }
 
@@ -149,7 +154,7 @@ impl BaseSrcImpl for XImageRedux {
         // Check if time for next frame
         
         
-        if let Err(e) = self.resize_if_needed() {
+        if let Err(e) = self.update_size_if_needed() {
             error!(CAT, "Failed to resize: {}", e.to_string());
             return Err(gst::FlowError::Error);
         }
@@ -170,9 +175,35 @@ impl BaseSrcImpl for XImageRedux {
         Ok(CreateSuccess::NewBuffer(frame))
     }
 
+    // fn set_caps(&self, element: &Self::Type, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
+    //     println!("CAPS: {:#?}", caps);
+    //     Ok(())
+    // }
+
     fn caps(&self, element: &Self::Type, filter: Option<&gst::Caps>) -> Option<gst::Caps> {
-        
-        None
+        if let Err(e) = self.update_size_if_needed() {
+            error!(CAT, "Failed to update size: {}", e.to_string());
+            return None;
+        }
+
+        let state = self.state.lock().unwrap();
+        let size = state.size.as_ref().unwrap();
+
+        let fmt = match unsafe { self.get_video_format() } {
+            Ok(fmt) => fmt,
+            Err(e) => {
+                error!(CAT, "Failed to get video format: {}", e.to_string());
+                return None;
+            }
+        };
+
+        let c_str: &CStr = unsafe { CStr::from_ptr(gst_video_format_to_string(fmt)) };
+
+        Some(gst::Caps::new_simple("video/x-raw", &[
+            ("format", &c_str.to_str().unwrap()),
+            ("width", &(size.width as u32)),
+            ("height", &(size.height as u32))
+        ]))
     }
 }
 
@@ -192,7 +223,14 @@ impl ElementImpl for XImageRedux {
 
     fn pad_templates() -> &'static [gst::PadTemplate] {
         static PAD_TEMPLATES: Lazy<Vec<gst::PadTemplate>> = Lazy::new(|| {
-            let caps = gst::Caps::new_any();
+            let caps = gst::Caps::builder_full()
+                .structure(gst::Structure::builder("video/x-raw")
+                    .field("framerate", gst::FractionRange::new(gst::Fraction::new(0, 1), gst::Fraction::new(i32::MAX, 1)))
+                    .field("width", gst::IntRange::new(0, i32::MAX))
+                    .field("height", gst::IntRange::new(0, i32::MAX))
+                    .build()
+                ).build();
+
             let src_pad_template = gst::PadTemplate::new(
                 "src",
                 gst::PadDirection::Src,
@@ -224,13 +262,13 @@ impl ObjectImpl for XImageRedux {
 
     fn set_property(&self, _obj: &Self::Type, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         match pspec.name() {
-            "xid" => match value.get::<Xid>() {
+            "xid" => match value.get::<String>().unwrap().parse::<Xid>() {
                 Ok(xid) => {
                     let mut state = self.state.lock().unwrap();
                     let _ = state.xid.insert(xid);
                     state.needs_size_update = true;
                 }
-                Err(e) => panic!("Attempted to set xid with type {}, requires {}", e.actual_type(), e.requested_type()),
+                Err(e) => panic!("Failed to parse XID from String: {}", e),
             }
             _ => unimplemented!()
         }
