@@ -1,9 +1,9 @@
 use std::{sync::{Mutex, atomic::AtomicBool, Arc, MutexGuard}, time::Duration, ffi::CStr};
 
 use derivative::Derivative;
-use gst::{glib::{self, ffi::{G_LITTLE_ENDIAN, G_BIG_ENDIAN}}, subclass::prelude::{ObjectSubclass, ElementImpl, ObjectImpl, GstObjectImpl, ObjectImplExt, ElementImplExt}, prelude::{ToValue, ElementExtManual}, FlowError, error_msg};
+use gst::{glib::{self, ffi::{G_LITTLE_ENDIAN, G_BIG_ENDIAN}}, subclass::prelude::{ObjectSubclass, ElementImpl, ObjectImpl, GstObjectImpl, ObjectImplExt}, prelude::{ToValue, ElementExtManual}, FlowError, error_msg};
 use gst_app::prelude::BaseSrcExt;
-use gst_base::{BaseSrc, subclass::{prelude::BaseSrcImpl, base_src::CreateSuccess}};
+use gst_base::{subclass::{prelude::{BaseSrcImpl, BaseSrcImplExt, PushSrcImpl}, base_src::CreateSuccess}, PushSrc};
 use gst_video::ffi::{gst_video_format_from_masks, gst_video_format_to_string};
 use once_cell::sync::Lazy;
 use anyhow::{Result, bail};
@@ -30,7 +30,7 @@ struct State {
     #[derivative(Default(value="true"))]
     needs_size_update: bool,
     size: Option<Size>,
-    framerate: Duration,
+    frame_duration: Duration,
     resize_run: Option<Arc<AtomicBool>>
 }
 
@@ -64,7 +64,11 @@ impl XImageRedux {
 
         let reply = wait_for_reply(conn, cookie)?;
 
-        Ok(gst::Buffer::from_slice(reply.data().to_owned()))
+        let mut buf = gst::Buffer::from_slice(reply.data().to_owned());
+        let buf = buf.make_mut();
+        buf.set_duration(gst::ClockTime::from_mseconds(state.frame_duration.as_millis() as u64));
+
+        Ok(buf.to_owned())
     }
 
     // Function looks weird to get around mutex issues
@@ -191,38 +195,15 @@ fn get_connection<'a>(state: &'a MutexGuard<State>) -> Result<(&'a xcb::Connecti
 impl ObjectSubclass for XImageRedux {
     const NAME: &'static str = "XImageRedux";
     type Type = super::XImageRedux;
-    type ParentType = BaseSrc;
+    type ParentType = PushSrc;
 }
 
-impl BaseSrcImpl for XImageRedux {
-    fn is_seekable(&self, _element: &Self::Type) -> bool {
-        false
-    }
-
-    fn start(&self, _element: &Self::Type) -> Result<(), gst::ErrorMessage> {
-        if let Err(e) = self.open_connection() {
-            Err(error_msg!(
-                gst::ResourceError::Failed,
-                [&e.to_string()]
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn stop(&self, _element: &Self::Type) -> Result<(), gst::ErrorMessage> {
-        self.state.lock().unwrap().connection.take();
-
-        Ok(())
-    }
-
+impl PushSrcImpl for XImageRedux {
     fn create(
             &self,
-            _element: &Self::Type,
-            _offset: u64,
-            _buffer: Option<&mut gst::BufferRef>,
-            _length: u32,
-        ) -> Result<gst_base::subclass::base_src::CreateSuccess, gst::FlowError> {
+            element: &Self::Type,
+            buffer: Option<&mut gst::BufferRef>,
+        ) -> Result<CreateSuccess, gst::FlowError> {
         // Check if time for next frame
         
         
@@ -246,7 +227,9 @@ impl BaseSrcImpl for XImageRedux {
 
         Ok(CreateSuccess::NewBuffer(frame))
     }
+}
 
+impl BaseSrcImpl for XImageRedux {
     fn caps(&self, element: &Self::Type, _filter: Option<&gst::Caps>) -> Option<gst::Caps> {
         if self.state.lock().unwrap().connection.is_none() {
             if let Err(e) = self.open_connection() {
@@ -279,6 +262,52 @@ impl BaseSrcImpl for XImageRedux {
             ("height", &(size.height as i32)),
             ("framerate", &(gst::FractionRange::new(gst::Fraction::new(0, 1), gst::Fraction::new(i32::MAX, 1))))
         ]))
+    }
+
+    fn set_caps(&self, _element: &Self::Type, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
+        if self.state.lock().unwrap().connection.is_none() {
+            return Err(gst::LoggableError::new(*CAT, glib::BoolError::new("Not ready!", "imp.rs", "set_caps", 0)));
+        }
+
+        let framerate: gst::Fraction = match caps.structure(0).unwrap().value("framerate").unwrap().get() {
+            Ok(f) => f,
+            Err(e) => return Err(gst::LoggableError::new(*CAT, glib::BoolError::new(format!("Error: {}", e.to_string()), "imp.rs", "set_caps", 0)))
+        };
+
+        self.state.lock().unwrap().frame_duration = Duration::from_millis(1000 * framerate.denom() as u64 / framerate.numer() as u64);
+
+        Ok(())
+    }
+
+    fn fixate(&self, element: &Self::Type, mut caps: gst::Caps) -> gst::Caps {
+        let caps = caps.get_mut().unwrap();
+
+        for i in 0..caps.size() {
+            caps.structure_mut(i).unwrap().fixate_field_nearest_fraction("framerate", gst::Fraction::new(25, 1));
+        }
+
+        self.parent_fixate(element, caps.to_owned())
+    }
+
+    fn is_seekable(&self, _element: &Self::Type) -> bool {
+        false
+    }
+
+    fn start(&self, _element: &Self::Type) -> Result<(), gst::ErrorMessage> {
+        if let Err(e) = self.open_connection() {
+            Err(error_msg!(
+                gst::ResourceError::Failed,
+                [&e.to_string()]
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn stop(&self, _element: &Self::Type) -> Result<(), gst::ErrorMessage> {
+        self.state.lock().unwrap().connection.take();
+
+        Ok(())
     }
 }
 
