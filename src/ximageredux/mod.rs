@@ -3,7 +3,7 @@ use gst::{glib, prelude::StaticType};
 mod imp;
 
 glib::wrapper! {
-    pub struct XImageRedux(ObjectSubclass<imp::XImageRedux>) @extends gst_base::BaseSrc, gst::Element, gst::Object;
+    pub struct XImageRedux(ObjectSubclass<imp::XImageRedux>) @extends gst_base::PushSrc, gst_base::BaseSrc, gst::Element, gst::Object;
 }
 
 impl Default for XImageRedux {

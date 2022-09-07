@@ -265,6 +265,7 @@ impl BaseSrcImpl for XImageRedux {
     }
 
     fn set_caps(&self, _element: &Self::Type, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
+        println!("Set caps");
         if self.state.lock().unwrap().connection.is_none() {
             return Err(gst::LoggableError::new(*CAT, glib::BoolError::new("Not ready!", "imp.rs", "set_caps", 0)));
         }
@@ -279,6 +280,29 @@ impl BaseSrcImpl for XImageRedux {
         Ok(())
     }
 
+    // fn negotiate(&self, element: &Self::Type) -> Result<(), gst::LoggableError> {
+    //     println!("Negotiate");
+    //     let caps = element.pads()[0].query_caps(None);
+
+    //     if self.state.lock().unwrap().connection.is_none() {
+    //         return Err(gst::LoggableError::new(*CAT, glib::BoolError::new("Not ready!", "imp.rs", "set_caps", 0)));
+    //     }
+
+    //     let framerate: gst::Fraction = match caps.structure(0).unwrap().value("framerate").unwrap().get() {
+    //         Ok(f) => f,
+    //         Err(e) => return Err(gst::LoggableError::new(*CAT, glib::BoolError::new(format!("Error: {}", e.to_string()), "imp.rs", "set_caps", 0)))
+    //     };
+
+    //     self.state.lock().unwrap().frame_duration = Duration::from_millis(1000 * framerate.denom() as u64 / framerate.numer() as u64);
+
+    //     Ok(())
+    // }
+
+    // fn event(&self, element: &Self::Type, event: &gst::Event) -> bool {
+    //     println!("EVENT");
+    //     true
+    // }
+
     fn fixate(&self, element: &Self::Type, mut caps: gst::Caps) -> gst::Caps {
         let caps = caps.get_mut().unwrap();
 
@@ -287,10 +311,6 @@ impl BaseSrcImpl for XImageRedux {
         }
 
         self.parent_fixate(element, caps.to_owned())
-    }
-
-    fn is_seekable(&self, _element: &Self::Type) -> bool {
-        false
     }
 
     fn start(&self, _element: &Self::Type) -> Result<(), gst::ErrorMessage> {
@@ -388,7 +408,7 @@ impl ObjectImpl for XImageRedux {
     fn constructed(&self, obj: &Self::Type) {
         self.parent_constructed(obj);
         obj.set_live(true);
-        obj.set_format(gst::Format::Bytes);
+        obj.set_format(gst::Format::Time);
     }
 }
 
