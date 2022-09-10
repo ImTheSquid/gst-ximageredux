@@ -1,13 +1,14 @@
-use std::{sync::{Mutex, atomic::AtomicBool, Arc, MutexGuard}, time::Duration, ffi::CStr};
+use std::{sync::{Mutex, atomic::{AtomicBool, Ordering}, Arc, MutexGuard}, time::Duration, ffi::CStr, thread::{JoinHandle, self}};
 
 use derivative::Derivative;
-use gst::{glib::{self, ffi::{G_LITTLE_ENDIAN, G_BIG_ENDIAN}}, subclass::prelude::{ObjectSubclass, ElementImpl, ObjectImpl, GstObjectImpl, ObjectImplExt}, prelude::{ToValue, ElementExtManual}, FlowError, error_msg};
+use gst::{glib::{self, ffi::{G_LITTLE_ENDIAN, G_BIG_ENDIAN}}, subclass::prelude::{ObjectSubclass, ElementImpl, ObjectImpl, GstObjectImpl, ObjectImplExt}, prelude::{ToValue, ElementExtManual}, FlowError, error_msg, traits::PadExt};
 use gst_app::prelude::BaseSrcExt;
 use gst_base::{subclass::{prelude::{BaseSrcImpl, BaseSrcImplExt, PushSrcImpl}, base_src::CreateSuccess}, PushSrc};
 use gst_video::ffi::{gst_video_format_from_masks, gst_video_format_to_string};
 use once_cell::sync::Lazy;
 use anyhow::{Result, bail};
-use xcb::{x::{GetGeometry, Drawable, GetImage, self, ImageOrder}, CookieWithReplyChecked, Connection};
+use xcb::{x::{GetGeometry, Drawable, GetImage, self, ImageOrder, ChangeWindowAttributes, Cw, EventMask}, CookieWithReplyChecked, Connection};
+use xcb::x::Event::ConfigureNotify;
 
 use gst::gst_error as error;
 
@@ -31,15 +32,16 @@ struct State {
     needs_size_update: bool,
     size: Option<Size>,
     frame_duration: Duration,
-    resize_run: Option<Arc<AtomicBool>>
+    resize_run: Option<Arc<AtomicBool>>,
+    resize_handle: Option<JoinHandle<()>>
 }
 
 #[derive(Default)]
 pub struct XImageRedux {
-    state: Mutex<State>
+    state: Arc<Mutex<State>>
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct Size {
     width: u16,
     height: u16
@@ -212,11 +214,6 @@ impl PushSrcImpl for XImageRedux {
             return Err(gst::FlowError::Error);
         }
 
-        // {
-        //     let state = self.state.lock().unwrap();
-        //     buffer.set_size(state.size.as_ref().unwrap().width as usize * state.size.as_ref().unwrap().height as usize * 3);
-        // }
-
         let frame = match self.get_frame() {
             Ok(f) => f,
             Err(e) => {
@@ -265,7 +262,6 @@ impl BaseSrcImpl for XImageRedux {
     }
 
     fn set_caps(&self, _element: &Self::Type, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
-        println!("Set caps");
         if self.state.lock().unwrap().connection.is_none() {
             return Err(gst::LoggableError::new(*CAT, glib::BoolError::new("Not ready!", "imp.rs", "set_caps", 0)));
         }
@@ -280,29 +276,6 @@ impl BaseSrcImpl for XImageRedux {
         Ok(())
     }
 
-    // fn negotiate(&self, element: &Self::Type) -> Result<(), gst::LoggableError> {
-    //     println!("Negotiate");
-    //     let caps = element.pads()[0].query_caps(None);
-
-    //     if self.state.lock().unwrap().connection.is_none() {
-    //         return Err(gst::LoggableError::new(*CAT, glib::BoolError::new("Not ready!", "imp.rs", "set_caps", 0)));
-    //     }
-
-    //     let framerate: gst::Fraction = match caps.structure(0).unwrap().value("framerate").unwrap().get() {
-    //         Ok(f) => f,
-    //         Err(e) => return Err(gst::LoggableError::new(*CAT, glib::BoolError::new(format!("Error: {}", e.to_string()), "imp.rs", "set_caps", 0)))
-    //     };
-
-    //     self.state.lock().unwrap().frame_duration = Duration::from_millis(1000 * framerate.denom() as u64 / framerate.numer() as u64);
-
-    //     Ok(())
-    // }
-
-    // fn event(&self, element: &Self::Type, event: &gst::Event) -> bool {
-    //     println!("EVENT");
-    //     true
-    // }
-
     fn fixate(&self, element: &Self::Type, mut caps: gst::Caps) -> gst::Caps {
         let caps = caps.get_mut().unwrap();
 
@@ -315,16 +288,80 @@ impl BaseSrcImpl for XImageRedux {
 
     fn start(&self, _element: &Self::Type) -> Result<(), gst::ErrorMessage> {
         if let Err(e) = self.open_connection() {
-            Err(error_msg!(
+            return Err(error_msg!(
                 gst::ResourceError::Failed,
                 [&e.to_string()]
             ))
-        } else {
-            Ok(())
         }
+
+        {
+            let state_wrap = self.state.lock().unwrap();
+            let (conn, xid) = get_connection(&state_wrap).unwrap();
+
+            conn.send_request(&ChangeWindowAttributes {
+                window: unsafe { xcb::XidNew::new(xid) },
+                value_list: &[Cw::EventMask(EventMask::STRUCTURE_NOTIFY)]
+            });
+        }
+
+        let run = Arc::new(AtomicBool::new(true));
+        let _  = self.state.lock().unwrap().resize_run.insert(run.clone());
+
+        let state_arc = self.state.clone();
+
+        let _ = self.state.lock().unwrap().resize_handle.insert(thread::spawn(move || {
+            let conn = xcb::Connection::connect(None).unwrap().0;
+
+            let mut last_size = None;
+
+            while run.load(Ordering::SeqCst) {
+                match conn.poll_for_event() {
+                    Ok(e) => if let Some(ev) = e {
+                        if let xcb::Event::X(e) = ev {
+                            match e {
+                                // Listen for size changes
+                                ConfigureNotify(e) => {
+                                    println!("Conf notify");
+                                    let size = Size { width: e.width().into(), height: e.height().into() };
+
+                                    // Don't send window relocation events (size stays the same)
+                                    if let Some(last_size) = last_size.as_ref() {
+                                        if *last_size == size {
+                                            continue;
+                                        }
+                                    } else {
+                                        let _ = last_size.insert(size);
+                                    }
+
+                                    println!("Size update!");
+
+                                    state_arc.lock().unwrap().needs_size_update = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        error!(CAT, "Failed to poll for X event: {e}");
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(50));
+            }
+        }));
+
+        Ok(())
     }
 
     fn stop(&self, _element: &Self::Type) -> Result<(), gst::ErrorMessage> {
+        if let Some(run) = self.state.lock().unwrap().resize_run.take() {
+            run.store(false, Ordering::SeqCst);
+        }
+
+        if let Some(handle) = self.state.lock().unwrap().resize_handle.take() {
+            handle.join().unwrap();
+        }
+
         self.state.lock().unwrap().connection.take();
 
         Ok(())
@@ -386,13 +423,26 @@ impl ObjectImpl for XImageRedux {
 
     fn set_property(&self, _obj: &Self::Type, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         match pspec.name() {
-            "xid" => match value.get::<String>().unwrap().parse::<Xid>() {
-                Ok(xid) => {
-                    let mut state = self.state.lock().unwrap();
-                    let _ = state.xid.insert(xid);
-                    state.needs_size_update = true;
+            "xid" => {
+                let string = value.get::<String>().unwrap();
+                match string.parse::<Xid>() {
+                    Ok(xid) => {
+                        let mut state = self.state.lock().unwrap();
+                        let _ = state.xid.insert(xid);
+                        state.needs_size_update = true;
+                    }
+                    Err(_) => {
+                        let no_prefix = string.trim_start_matches("0x");
+                        match Xid::from_str_radix(no_prefix, 16) {
+                            Ok(xid) => {
+                                let mut state = self.state.lock().unwrap();
+                                let _ = state.xid.insert(xid);
+                                state.needs_size_update = true;
+                            }
+                            Err(_) => panic!("Failed to parse XID from String"),
+                        }
+                    },
                 }
-                Err(e) => panic!("Failed to parse XID from String: {}", e),
             }
             _ => unimplemented!()
         }
