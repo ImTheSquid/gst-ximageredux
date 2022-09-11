@@ -518,11 +518,11 @@ impl ObjectImpl for XImageRedux {
     fn properties() -> &'static [glib::ParamSpec] {
         static PROPERTIES: Lazy<Vec<glib::ParamSpec>> = Lazy::new(|| {
             vec![
-                glib::ParamSpecString::builder("xid")
+                glib::ParamSpecUInt::builder("xid")
                     .nick("XID")
                     .blurb("XID of window to capture")
                     .build(),
-                glib::ParamSpecString::builder("show-cursor")
+                glib::ParamSpecBoolean::builder("show-cursor")
                     .nick("Show Cursor")
                     .blurb("Whether or not to show the cursor (requires XFixes)")
                     .build()
@@ -534,40 +534,8 @@ impl ObjectImpl for XImageRedux {
 
     fn set_property(&self, _obj: &Self::Type, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         match pspec.name() {
-            "xid" => {
-                if let Ok(xid) = value.get::<u64>() {
-                    let mut state = self.state.lock().unwrap();
-                    let _ = state.xid.insert(xid.try_into().unwrap());
-                    state.needs_size_update = true;
-                    return;
-                }
-
-                let string = value.get::<String>().unwrap();
-                match string.parse::<Xid>() {
-                    Ok(xid) => {
-                        let mut state = self.state.lock().unwrap();
-                        let _ = state.xid.insert(xid);
-                        state.needs_size_update = true;
-                    }
-                    Err(_) => {
-                        let no_prefix = string.trim_start_matches("0x");
-                        match Xid::from_str_radix(no_prefix, 16) {
-                            Ok(xid) => {
-                                let mut state = self.state.lock().unwrap();
-                                let _ = state.xid.insert(xid);
-                                state.needs_size_update = true;
-                            }
-                            Err(_) => panic!("Failed to parse XID from String"),
-                        }
-                    },
-                }
-            }
-            "show-cursor" => {
-                match value.get::<bool>() {
-                    Ok(show) => self.state.lock().unwrap().show_cursor = show,
-                    Err(_) => panic!("Failed to parse show-cursor from property"),
-                }
-            }
+            "xid" => self.state.lock().unwrap().xid = Some(value.get::<Xid>().unwrap()),
+            "show-cursor" => self.state.lock().unwrap().show_cursor = value.get::<bool>().unwrap(),
             _ => unimplemented!()
         }
     }
