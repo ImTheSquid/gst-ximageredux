@@ -1,16 +1,19 @@
 use std::{sync::{Mutex, atomic::{AtomicBool, Ordering}, Arc, MutexGuard}, time::Duration, ffi::CStr, thread::{JoinHandle, self}};
 
 use derivative::Derivative;
-use gst::{glib::{self, ffi::{G_LITTLE_ENDIAN, G_BIG_ENDIAN}}, subclass::prelude::{ObjectSubclass, ElementImpl, ObjectImpl, GstObjectImpl, ObjectImplExt}, prelude::{ToValue, ElementExtManual}, FlowError, error_msg, traits::PadExt};
+use gst::{glib::{self, ffi::{G_LITTLE_ENDIAN, G_BIG_ENDIAN}}, subclass::prelude::{ObjectSubclass, ElementImpl, ObjectImpl, GstObjectImpl, ObjectImplExt}, prelude::{ToValue, ElementExtManual}, FlowError, error_msg};
 use gst_app::prelude::BaseSrcExt;
 use gst_base::{subclass::{prelude::{BaseSrcImpl, BaseSrcImplExt, PushSrcImpl}, base_src::CreateSuccess}, PushSrc};
 use gst_video::ffi::{gst_video_format_from_masks, gst_video_format_to_string};
 use once_cell::sync::Lazy;
 use anyhow::{Result, bail};
-use xcb::{x::{GetGeometry, Drawable, GetImage, self, ImageOrder, ChangeWindowAttributes, Cw, EventMask}, CookieWithReplyChecked, Connection};
+use xcb::{x::{GetGeometry, Drawable, GetImage, self, ImageOrder, ChangeWindowAttributes, Cw, EventMask, QueryPointer}, CookieWithReplyChecked, Connection};
 use xcb::x::Event::ConfigureNotify;
 
-use gst::gst_error as error;
+use gst::{
+    gst_error as error,
+    gst_trace as trace
+};
 
 pub static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
@@ -29,11 +32,16 @@ struct State {
     screen_num: Option<i32>,
     xid: Option<Xid>,
     #[derivative(Default(value="true"))]
+    show_cursor: bool,
+    #[derivative(Default(value="true"))]
     needs_size_update: bool,
+    start_x: i16,
+    start_y: i16,
     size: Option<Size>,
     frame_duration: Duration,
     resize_run: Option<Arc<AtomicBool>>,
-    resize_handle: Option<JoinHandle<()>>
+    resize_handle: Option<JoinHandle<()>>,
+    last_frame: Option<gst::Buffer>
 }
 
 #[derive(Default)]
@@ -45,6 +53,12 @@ pub struct XImageRedux {
 struct Size {
     width: u16,
     height: u16
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Position {
+    x: i16,
+    y: i16
 }
 
 impl XImageRedux {
@@ -74,7 +88,8 @@ impl XImageRedux {
     }
 
     // Function looks weird to get around mutex issues
-    fn update_size_if_needed(&self) -> Result<()> {
+    // Returns whether size was updated
+    fn update_size_if_needed(&self) -> Result<bool> {
         let should_update = {
             let mut state = self.state.lock().unwrap();
 
@@ -91,11 +106,11 @@ impl XImageRedux {
             let _ = self.state.lock().unwrap().size.insert(new);
         }
 
-        Ok(())
+        Ok(should_update)
     }
 
     fn get_size(&self) -> Result<Size> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let (conn, xid) = get_connection(&state)?;
         
         let cookie = conn.send_request(&GetGeometry {
@@ -103,6 +118,9 @@ impl XImageRedux {
         });
 
         let reply = wait_for_reply(conn, cookie)?;
+
+        state.start_x = reply.x();
+        state.start_y = reply.y();
 
         Ok(Size {
             width: reply.width(),
@@ -173,6 +191,26 @@ impl XImageRedux {
 
         Ok(gst_video_format_from_masks(geometry_reply.depth().into(), bpp.into(), endianness, red_mask, green_mask, blue_mask, alpha_mask))
     }
+
+    // Returns the relative position of the cursor in the window if it's in the window region
+    fn cursor_is_in_bounds(&self) -> Result<Option<Position>> {
+        let state = self.state.lock().unwrap();
+        let (conn, xid) = get_connection(&state)?;
+        let win = unsafe { xcb::XidNew::new(xid) };
+
+        let cookie = conn.send_request(&QueryPointer {
+            window: win
+        });
+
+        let reply = wait_for_reply(conn, cookie)?;
+
+        Ok(if reply.same_screen() && reply.child() == win {
+            Some(Position {
+                x: reply.win_x(),
+                y: reply.win_y(),
+            })
+        } else { None })
+    }
 }
 
 fn wait_for_reply<C>(conn: &Connection, cookie: C) -> Result<C::Reply> 
@@ -204,23 +242,51 @@ impl PushSrcImpl for XImageRedux {
     fn create(
             &self,
             element: &Self::Type,
-            buffer: Option<&mut gst::BufferRef>,
+            _buffer: Option<&mut gst::BufferRef>,
         ) -> Result<CreateSuccess, gst::FlowError> {
         // Check if time for next frame
         
-        
-        if let Err(e) = self.update_size_if_needed() {
-            error!(CAT, "Failed to resize: {}", e.to_string());
-            return Err(gst::FlowError::Error);
+        match self.update_size_if_needed() {
+            Ok(did_update_size) => if did_update_size {
+                if let Err(e) = self.negotiate(element) {
+                    error!(CAT, "Failed to renegotiate after resize: {}", e.to_string());
+                    return Err(gst::FlowError::Error);
+                }
+            }
+            Err(e) => {
+                error!(CAT, "Failed to resize: {}", e.to_string());
+                return Err(gst::FlowError::Error);
+            }
         }
 
         let frame = match self.get_frame() {
             Ok(f) => f,
             Err(e) => {
-                error!(CAT, "Failed to get frame: {}", e.to_string());
-                return Err(FlowError::Error);
+                // If failed to get frame, try to use the last one as a temporary measure
+                if let Some(buf) = &self.state.lock().unwrap().last_frame {
+                    trace!(CAT, "Failed to get frame, but last frame is usable.");
+                    return Ok(CreateSuccess::NewBuffer(buf.clone()));
+                } else {
+                    error!(CAT, "Failed to get frame: {}", e.to_string());
+                    return Err(FlowError::Error);
+                }
             }
         };
+
+        // Copy cursor in if needed
+        if self.state.lock().unwrap().show_cursor {
+            match self.cursor_is_in_bounds() {
+                Ok(res) => if let Some(pos) = res {
+                    
+                }
+                Err(e) => {
+                    error!(CAT, "Failed to get cursor position: {}", e.to_string());
+                    return Err(gst::FlowError::Error);
+                }
+            }
+        }
+
+        let _ = self.state.lock().unwrap().last_frame.insert(frame.clone());
 
         Ok(CreateSuccess::NewBuffer(frame))
     }
@@ -294,15 +360,10 @@ impl BaseSrcImpl for XImageRedux {
             ))
         }
 
-        {
+        let xid = {
             let state_wrap = self.state.lock().unwrap();
-            let (conn, xid) = get_connection(&state_wrap).unwrap();
-
-            conn.send_request(&ChangeWindowAttributes {
-                window: unsafe { xcb::XidNew::new(xid) },
-                value_list: &[Cw::EventMask(EventMask::STRUCTURE_NOTIFY)]
-            });
-        }
+            get_connection(&state_wrap).unwrap().1
+        };
 
         let run = Arc::new(AtomicBool::new(true));
         let _  = self.state.lock().unwrap().resize_run.insert(run.clone());
@@ -311,6 +372,14 @@ impl BaseSrcImpl for XImageRedux {
 
         let _ = self.state.lock().unwrap().resize_handle.insert(thread::spawn(move || {
             let conn = xcb::Connection::connect(None).unwrap().0;
+
+            conn.send_request(&ChangeWindowAttributes {
+                window: unsafe { xcb::XidNew::new(xid) },
+                value_list: &[Cw::EventMask(EventMask::STRUCTURE_NOTIFY)]
+            });
+
+            // VERY IMPORTANT
+            conn.flush().unwrap();
 
             let mut last_size = None;
 
@@ -321,7 +390,6 @@ impl BaseSrcImpl for XImageRedux {
                             match e {
                                 // Listen for size changes
                                 ConfigureNotify(e) => {
-                                    println!("Conf notify");
                                     let size = Size { width: e.width().into(), height: e.height().into() };
 
                                     // Don't send window relocation events (size stays the same)
@@ -332,8 +400,6 @@ impl BaseSrcImpl for XImageRedux {
                                     } else {
                                         let _ = last_size.insert(size);
                                     }
-
-                                    println!("Size update!");
 
                                     state_arc.lock().unwrap().needs_size_update = true;
                                 }
@@ -444,6 +510,12 @@ impl ObjectImpl for XImageRedux {
                     },
                 }
             }
+            "show-cursor" => {
+                match value.get::<bool>() {
+                    Ok(show) => self.state.lock().unwrap().show_cursor = show,
+                    Err(_) => panic!("Failed to parse show-cursor from property"),
+                }
+            }
             _ => unimplemented!()
         }
     }
@@ -451,6 +523,7 @@ impl ObjectImpl for XImageRedux {
     fn property(&self, _obj: &Self::Type, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
         match pspec.name() {
             "xid" => self.state.lock().unwrap().xid.unwrap_or(0).to_value(),
+            "show-cursor" => self.state.lock().unwrap().show_cursor.to_value(),
             _ => unimplemented!()
         }
     }
