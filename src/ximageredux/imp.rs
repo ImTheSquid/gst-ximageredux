@@ -277,7 +277,7 @@ impl PushSrcImpl for XImageRedux {
         if self.state.lock().unwrap().show_cursor {
             match self.cursor_is_in_bounds() {
                 Ok(res) => if let Some(pos) = res {
-                    
+
                 }
                 Err(e) => {
                     error!(CAT, "Failed to get cursor position: {}", e.to_string());
@@ -480,6 +480,10 @@ impl ObjectImpl for XImageRedux {
                 glib::ParamSpecString::builder("xid")
                     .nick("XID")
                     .blurb("XID of window to capture")
+                    .build(),
+                glib::ParamSpecString::builder("show-cursor")
+                    .nick("Show Cursor")
+                    .blurb("Whether or not to show the cursor (requires XFixes)")
                     .build()
             ]
         });
