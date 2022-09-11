@@ -535,6 +535,13 @@ impl ObjectImpl for XImageRedux {
     fn set_property(&self, _obj: &Self::Type, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         match pspec.name() {
             "xid" => {
+                if let Ok(xid) = value.get::<u64>() {
+                    let mut state = self.state.lock().unwrap();
+                    let _ = state.xid.insert(xid.try_into().unwrap());
+                    state.needs_size_update = true;
+                    return;
+                }
+
                 let string = value.get::<String>().unwrap();
                 match string.parse::<Xid>() {
                     Ok(xid) => {
