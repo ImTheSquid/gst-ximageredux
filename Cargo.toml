@@ -15,7 +15,7 @@ gst-app = { package = "gstreamer-app", version = "0.18", features = ["v1_16"] }
 gst-base = { package = "gstreamer-base", version = "0.18", features = ["v1_16"] }
 gst-video = { package = "gstreamer-video", version = "0.18", features = ["v1_16"] }
 once_cell = "1.0"
-xcb = "1"
+xcb = { version = "1", features = ["xfixes"] }
 derivative = "2.2.0"
 anyhow = "1.0.58"
 
