@@ -8,7 +8,7 @@ glib::wrapper! {
 
 impl Default for XImageRedux {
     fn default() -> Self {
-        glib::Object::new(&[]).unwrap()
+        glib::Object::new::<XImageRedux>(&[])
     }
 }
 

@@ -1,7 +1,7 @@
 use std::{sync::{Mutex, atomic::{AtomicBool, Ordering}, Arc, MutexGuard}, time::Duration, ffi::CStr, thread::{JoinHandle, self}, convert::TryInto};
 
 use derivative::Derivative;
-use gst::{glib::{self, ffi::{G_LITTLE_ENDIAN, G_BIG_ENDIAN}}, subclass::prelude::{ObjectSubclass, ElementImpl, ObjectImpl, GstObjectImpl, ObjectImplExt}, prelude::{ToValue, ElementExtManual}, FlowError, error_msg};
+use gst::{glib::{self, ffi::{G_LITTLE_ENDIAN, G_BIG_ENDIAN}}, subclass::prelude::{ObjectSubclass, ElementImpl, ObjectImpl, GstObjectImpl, ObjectImplExt, ObjectSubclassExt}, prelude::{ToValue, ElementExtManual, ParamSpecBuilderExt}, FlowError, error_msg};
 use gst_app::prelude::BaseSrcExt;
 use gst_base::{subclass::{prelude::{BaseSrcImpl, BaseSrcImplExt, PushSrcImpl}, base_src::CreateSuccess}, PushSrc};
 use gst_video::ffi::{gst_video_format_from_masks, gst_video_format_to_string};
@@ -11,10 +11,7 @@ use xcb::{x::{GetGeometry, Drawable, GetImage, self, ImageOrder, ChangeWindowAtt
 use xcb::x::Event::ConfigureNotify;
 use std::convert::TryFrom;
 
-use gst::{
-    gst_error as error,
-    gst_trace as trace
-};
+use gst::{error, trace};
 
 pub static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
@@ -256,7 +253,6 @@ impl ObjectSubclass for XImageRedux {
 impl PushSrcImpl for XImageRedux {
     fn create(
             &self,
-            element: &Self::Type,
             _buffer: Option<&mut gst::BufferRef>,
         ) -> Result<CreateSuccess, gst::FlowError> {
         // Check if time for next frame
@@ -276,7 +272,7 @@ impl PushSrcImpl for XImageRedux {
         // Updates size
         match self.update_size_if_needed() {
             Ok(did_update_size) => if did_update_size {
-                if let Err(e) = self.negotiate(element) {
+                if let Err(e) = self.negotiate() {
                     error!(CAT, "Failed to renegotiate after resize: {}", e.to_string());
                     return Err(gst::FlowError::Error);
                 }
@@ -334,11 +330,11 @@ impl PushSrcImpl for XImageRedux {
 }
 
 impl BaseSrcImpl for XImageRedux {
-    fn caps(&self, element: &Self::Type, _filter: Option<&gst::Caps>) -> Option<gst::Caps> {
+    fn caps(&self, _filter: Option<&gst::Caps>) -> Option<gst::Caps> {
         if self.state.lock().unwrap().connection.is_none() {
             if let Err(e) = self.open_connection() {
                 error!(CAT, "Failed to open connection: {}", e);
-                return Some(element.pad_template_list()[0].caps())
+                return Some(self.obj().pad_template_list().next().unwrap().caps().copy())
             }
         }
 
@@ -368,7 +364,7 @@ impl BaseSrcImpl for XImageRedux {
         ]))
     }
 
-    fn set_caps(&self, _element: &Self::Type, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
+    fn set_caps(&self, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
         if self.state.lock().unwrap().connection.is_none() {
             return Err(gst::LoggableError::new(*CAT, glib::BoolError::new("Not ready!", "imp.rs", "set_caps", 0)));
         }
@@ -383,17 +379,17 @@ impl BaseSrcImpl for XImageRedux {
         Ok(())
     }
 
-    fn fixate(&self, element: &Self::Type, mut caps: gst::Caps) -> gst::Caps {
+    fn fixate(&self, mut caps: gst::Caps) -> gst::Caps {
         let caps = caps.get_mut().unwrap();
 
         for i in 0..caps.size() {
             caps.structure_mut(i).unwrap().fixate_field_nearest_fraction("framerate", gst::Fraction::new(25, 1));
         }
 
-        self.parent_fixate(element, caps.to_owned())
+        self.parent_fixate(caps.to_owned())
     }
 
-    fn start(&self, _element: &Self::Type) -> Result<(), gst::ErrorMessage> {
+    fn start(&self) -> Result<(), gst::ErrorMessage> {
         if let Err(e) = self.open_connection() {
             return Err(error_msg!(
                 gst::ResourceError::Failed,
@@ -460,7 +456,7 @@ impl BaseSrcImpl for XImageRedux {
         Ok(())
     }
 
-    fn stop(&self, _element: &Self::Type) -> Result<(), gst::ErrorMessage> {
+    fn stop(&self) -> Result<(), gst::ErrorMessage> {
         if let Some(run) = self.state.lock().unwrap().resize_run.take() {
             run.store(false, Ordering::SeqCst);
         }
@@ -532,7 +528,7 @@ impl ObjectImpl for XImageRedux {
         PROPERTIES.as_ref()
     }
 
-    fn set_property(&self, _obj: &Self::Type, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+    fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         match pspec.name() {
             "xid" => self.state.lock().unwrap().xid = Some(value.get::<Xid>().unwrap()),
             "show-cursor" => self.state.lock().unwrap().show_cursor = value.get::<bool>().unwrap(),
@@ -540,7 +536,7 @@ impl ObjectImpl for XImageRedux {
         }
     }
 
-    fn property(&self, _obj: &Self::Type, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
+    fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
         match pspec.name() {
             "xid" => self.state.lock().unwrap().xid.unwrap_or(0).to_value(),
             "show-cursor" => self.state.lock().unwrap().show_cursor.to_value(),
@@ -548,10 +544,10 @@ impl ObjectImpl for XImageRedux {
         }
     }
 
-    fn constructed(&self, obj: &Self::Type) {
-        self.parent_constructed(obj);
-        obj.set_live(true);
-        obj.set_format(gst::Format::Time);
+    fn constructed(&self) {
+        self.parent_constructed();
+        self.obj().set_live(true);
+        self.obj().set_format(gst::Format::Time);
     }
 }
 
