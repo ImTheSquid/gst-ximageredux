@@ -1,0 +1,11 @@
+[package]
+name = "example"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+gst = { package = "gstreamer", version = "0.19.3", features = ["v1_16"] }
+gst-plugin-ximageredux = {path = "../"}
+tokio = { version = "1.20.1", features = ["full"] }

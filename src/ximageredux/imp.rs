@@ -1,7 +1,7 @@
 use std::{sync::{Mutex, atomic::{AtomicBool, Ordering}, Arc, MutexGuard}, time::Duration, ffi::CStr, thread::{JoinHandle, self}, convert::TryInto};
 
 use derivative::Derivative;
-use gst::{glib::{self, ffi::{G_LITTLE_ENDIAN, G_BIG_ENDIAN}}, subclass::prelude::{ObjectSubclass, ElementImpl, ObjectImpl, GstObjectImpl, ObjectImplExt, ObjectSubclassExt}, prelude::{ToValue, ElementExtManual, ParamSpecBuilderExt}, FlowError, error_msg};
+use gst::{glib::{self, ffi::{G_LITTLE_ENDIAN, G_BIG_ENDIAN}}, subclass::prelude::{ObjectSubclass, ElementImpl, ObjectImpl, GstObjectImpl, ObjectImplExt, ObjectSubclassExt}, prelude::{ToValue, ElementExtManual, ParamSpecBuilderExt, StaticType, ObjectExt}, FlowError, error_msg};
 use gst_app::prelude::BaseSrcExt;
 use gst_base::{subclass::{prelude::{BaseSrcImpl, BaseSrcImplExt, PushSrcImpl}, base_src::CreateSuccess}, PushSrc};
 use gst_video::ffi::{gst_video_format_from_masks, gst_video_format_to_string};
@@ -47,7 +47,7 @@ pub struct XImageRedux {
     state: Arc<Mutex<State>>
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 struct Size {
     width: u16,
     height: u16
@@ -101,6 +101,11 @@ impl XImageRedux {
 
         if should_update {
             let new = self.get_size()?;
+            let old_size = self.state.lock().unwrap().size;
+            if old_size.is_none() || old_size.unwrap() != new {
+                self.obj().emit_by_name::<()>("resize", &[&(new.width as u32), &(new.height as u32)]);
+            }
+            
             let _ = self.state.lock().unwrap().size.insert(new);
         }
 
@@ -511,6 +516,19 @@ impl ElementImpl for XImageRedux {
 }
 
 impl ObjectImpl for XImageRedux {
+    fn signals() -> &'static [glib::subclass::Signal] {
+        static SIGNALS: Lazy<Vec<glib::subclass::Signal>> = Lazy::new(|| {
+            vec! [
+                glib::subclass::Signal::builder("resize")
+                    // Width, height
+                    .param_types([u32::static_type(), u32::static_type()])
+                    .build()
+            ]
+        });
+
+        SIGNALS.as_ref()
+    }
+
     fn properties() -> &'static [glib::ParamSpec] {
         static PROPERTIES: Lazy<Vec<glib::ParamSpec>> = Lazy::new(|| {
             vec![
