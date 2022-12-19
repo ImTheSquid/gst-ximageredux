@@ -7,11 +7,14 @@ use gst_base::{subclass::{prelude::{BaseSrcImpl, BaseSrcImplExt, PushSrcImpl}, b
 use gst_video::ffi::{gst_video_format_from_masks, gst_video_format_to_string};
 use once_cell::sync::Lazy;
 use anyhow::{Result, bail};
-use xcb::{x::{GetGeometry, Drawable, GetImage, self, ImageOrder, ChangeWindowAttributes, Cw, EventMask, QueryPointer}, CookieWithReplyChecked, Connection};
+use xcb::{x::{GetGeometry, Drawable, GetImage, self, ImageOrder, ChangeWindowAttributes, Cw, EventMask, QueryPointer, GetProperty}, CookieWithReplyChecked, Connection};
 use xcb::x::Event::ConfigureNotify;
 use std::convert::TryFrom;
+use xcb::x::Event::PropertyNotify;
 
 use gst::{error, trace};
+
+use crate::WindowVisibility;
 
 pub static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
@@ -39,7 +42,8 @@ struct State {
     last_frame_time: Option<gst::ClockTime>,
     resize_run: Option<Arc<AtomicBool>>,
     resize_handle: Option<JoinHandle<()>>,
-    last_frame: Option<gst::Buffer>
+    last_frame: Option<gst::Buffer>,
+    visibility: WindowVisibility
 }
 
 #[derive(Default)]
@@ -47,7 +51,7 @@ pub struct XImageRedux {
     state: Arc<Mutex<State>>
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
 struct Size {
     width: u16,
     height: u16
@@ -57,6 +61,16 @@ struct Size {
 struct Position {
     x: i16,
     y: i16
+}
+
+impl From<i32> for WindowVisibility {
+    fn from(value: i32) -> Self {
+        match value {
+            1 => Self::Visible,
+            2 => Self::Hidden,
+            _ => Self::Unknown
+        }
+    }
 }
 
 impl XImageRedux {
@@ -102,11 +116,25 @@ impl XImageRedux {
         if should_update {
             let new = self.get_size()?;
             let old_size = self.state.lock().unwrap().size;
+
             if old_size.is_none() || old_size.unwrap() != new {
+                if old_size.is_none() || new.width != old_size.unwrap().width {
+                    self.obj().set_property("width", new.width as u32);
+                }
+                if old_size.is_none() || new.height != old_size.unwrap().height {
+                    self.obj().set_property("height", new.height as u32);
+                }
+
                 self.obj().emit_by_name::<()>("resize", &[&(new.width as u32), &(new.height as u32)]);
             }
-            
+
             let _ = self.state.lock().unwrap().size.insert(new);
+
+            let new = self.get_window_visibility()?;
+            if new != self.state.lock().unwrap().visibility {
+                self.state.lock().unwrap().visibility = new;
+                self.obj().set_property("visibility", new);
+            }
         }
 
         Ok(should_update)
@@ -131,6 +159,33 @@ impl XImageRedux {
             width: reply.width(),
             height: reply.height()
         })
+    }
+
+    fn get_window_visibility(&self) -> Result<WindowVisibility> {
+        let state = self.state.lock().unwrap();
+        let (conn, xid) = get_connection(&state)?;
+
+        let cookie = conn.send_request(&GetProperty {
+            delete: false,
+            window: unsafe { xcb::XidNew::new(xid) },
+            property: unsafe { xcb::XidNew::new(320) },
+            r#type: x::ATOM_ATOM,
+            long_offset: 0,
+            long_length: 4
+        });
+
+        match conn.wait_for_reply(cookie) {
+            Ok(res) => {
+                if res.value::<u32>().iter().any(|v| *v == 324) { // Hide
+                    Ok(WindowVisibility::Hidden)
+                } else { // Show
+                    Ok(WindowVisibility::Visible)
+                }
+            }
+            Err(e) => {
+                bail!(e);
+            }
+        }
     }
 
     fn open_connection(&self) -> Result<()> {
@@ -417,7 +472,7 @@ impl BaseSrcImpl for XImageRedux {
 
             conn.send_request(&ChangeWindowAttributes {
                 window: unsafe { xcb::XidNew::new(xid) },
-                value_list: &[Cw::EventMask(EventMask::STRUCTURE_NOTIFY)]
+                value_list: &[Cw::EventMask(EventMask::STRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE)]
             });
 
             // VERY IMPORTANT
@@ -443,6 +498,9 @@ impl BaseSrcImpl for XImageRedux {
                                         let _ = last_size.insert(size);
                                     }
 
+                                    state_arc.lock().unwrap().needs_size_update = true;
+                                }
+                                PropertyNotify(_) => {
                                     state_arc.lock().unwrap().needs_size_update = true;
                                 }
                                 _ => {}
@@ -539,6 +597,18 @@ impl ObjectImpl for XImageRedux {
                 glib::ParamSpecBoolean::builder("show-cursor")
                     .nick("Show Cursor")
                     .blurb("Whether or not to show the cursor (requires XFixes)")
+                    .build(),
+                glib::ParamSpecUInt::builder("width")
+                    .nick("Width")
+                    .blurb("The current window width")
+                    .build(),
+                glib::ParamSpecUInt::builder("height")
+                    .nick("Height")
+                    .blurb("The current window height, set by the plugin")
+                    .build(),
+                glib::ParamSpecEnum::builder("visibility", WindowVisibility::Unknown)
+                    .nick("Visibility")
+                    .blurb("The current window's visiblity")
                     .build()
             ]
         });
@@ -550,6 +620,8 @@ impl ObjectImpl for XImageRedux {
         match pspec.name() {
             "xid" => self.state.lock().unwrap().xid = Some(value.get::<Xid>().unwrap()),
             "show-cursor" => self.state.lock().unwrap().show_cursor = value.get::<bool>().unwrap(),
+            // Doesn't do anything on purpose, just dummy so impls can read values
+            "visibility" | "width" | "height" => {},
             _ => unimplemented!()
         }
     }
@@ -558,6 +630,9 @@ impl ObjectImpl for XImageRedux {
         match pspec.name() {
             "xid" => self.state.lock().unwrap().xid.unwrap_or(0).to_value(),
             "show-cursor" => self.state.lock().unwrap().show_cursor.to_value(),
+            "width" => (self.state.lock().unwrap().size.unwrap_or(Size::default()).width as u32).to_value(),
+            "height" => (self.state.lock().unwrap().size.unwrap_or(Size::default()).height as u32).to_value(),
+            "visibility" => self.state.lock().unwrap().visibility.to_value(),
             _ => unimplemented!()
         }
     }

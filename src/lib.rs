@@ -18,3 +18,13 @@ gst::plugin_define!(
     env!("CARGO_PKG_REPOSITORY"),
     env!("BUILD_REL_DATE")
 );
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, glib::Enum, Default)]
+#[enum_type(name = "GstXImageReduxWindowVisibility")]
+#[repr(i32)]
+pub enum WindowVisibility {
+    #[default]
+    Unknown = 0,
+    Visible = 1,
+    Hidden = 2
+}

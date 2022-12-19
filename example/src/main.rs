@@ -47,5 +47,14 @@ async fn main() {
         None
     });
 
+    ximageredux.connect_notify(None, |x, param| {
+        match param.name() {
+            "width" => println!("New width: {}", x.property::<u32>("width")),
+            "height" => println!("New height: {}", x.property::<u32>("height")),
+            "visibility" => println!("New visibility: {:?}", x.property::<ximageredux::WindowVisibility>("visibility")),
+            _ => unreachable!()
+        }
+    });
+
     tokio::signal::ctrl_c().await.unwrap();
 }
