@@ -1,4 +1,4 @@
-use gst::{glib, prelude::StaticType};
+use gst::{glib, prelude::{StaticType, PluginApiExt}};
 
 mod imp;
 
@@ -8,7 +8,7 @@ glib::wrapper! {
 
 impl Default for XImageRedux {
     fn default() -> Self {
-        glib::Object::new::<XImageRedux>(&[])
+        glib::Object::new::<XImageRedux>()
     }
 }
 
@@ -17,6 +17,8 @@ unsafe impl Sync for XImageRedux {}
 
 
 pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
+    XImageRedux::static_type().mark_as_plugin_api(gst::PluginAPIFlags::empty());
+
     gst::Element::register(
         Some(plugin),
         "ximageredux",

@@ -394,7 +394,7 @@ impl BaseSrcImpl for XImageRedux {
         if self.state.lock().unwrap().connection.is_none() {
             if let Err(e) = self.open_connection() {
                 error!(CAT, "Failed to open connection: {}", e);
-                return Some(self.obj().pad_template_list().next().unwrap().caps().copy())
+                return Some(self.obj().pad_template_list().iter().next().unwrap().caps().copy())
             }
         }
 
@@ -416,12 +416,12 @@ impl BaseSrcImpl for XImageRedux {
         let state = self.state.lock().unwrap();
         let size = state.size.as_ref().unwrap();
 
-        Some(gst::Caps::new_simple("video/x-raw", &[
-            ("format", &c_str.to_str().unwrap()),
-            ("width", &(size.width as i32)),
-            ("height", &(size.height as i32)),
-            ("framerate", &(gst::FractionRange::new(gst::Fraction::new(0, 1), gst::Fraction::new(i32::MAX, 1))))
-        ]))
+        Some(gst::Caps::builder("video/x-raw")
+            .field("format", &c_str.to_str().unwrap())
+            .field("width", &(size.width as i32))
+            .field("height", &(size.height as i32))
+            .field("framerate", &(gst::FractionRange::new(gst::Fraction::new(0, 1), gst::Fraction::new(i32::MAX, 1))))
+            .build())
     }
 
     fn set_caps(&self, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
@@ -606,7 +606,7 @@ impl ObjectImpl for XImageRedux {
                     .nick("Height")
                     .blurb("The current window height, set by the plugin")
                     .build(),
-                glib::ParamSpecEnum::builder("visibility", WindowVisibility::Unknown)
+                glib::ParamSpecEnum::builder::<WindowVisibility>("visibility")
                     .nick("Visibility")
                     .blurb("The current window's visiblity")
                     .build()
