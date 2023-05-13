@@ -1,6 +1,6 @@
 [package]
 name = "gst-plugin-ximageredux"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "X11 Window Capture Engine"
 repository = "https://github.com/ImTheSquid/gst-ximageredux"
